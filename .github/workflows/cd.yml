@@ -1,0 +1,94 @@
+name: CD (Deploy via SSH)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Node dependencies
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run build || echo "No build script found, skipping."
+          else
+            echo "No package.json found; skipping asset build."
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-source
+          path: |
+            .
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to Server (SSH)
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ secrets.SSH_HOST && secrets.SSH_USER && secrets.SSH_KEY && secrets.DEPLOY_PATH }}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-source
+          path: app
+
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.SSH_KEY }}" > private_key
+          chmod 600 private_key
+
+      - name: Rsync files to server
+        run: |
+          RSYNC_FLAGS="-az --delete --exclude='.git' --exclude='.github' --exclude='node_modules' --exclude='vendor' --exclude='storage/framework/cache' --exclude='storage/framework/sessions' --exclude='storage/framework/testing' --exclude='storage/logs' --exclude='.env'"
+          rsync $RSYNC_FLAGS -e "ssh -i private_key -o StrictHostKeyChecking=no -p ${SSH_PORT:-22}" app/ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ secrets.DEPLOY_PATH }}
+        env:
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+
+      - name: Run deployment tasks on server
+        run: |
+          ssh -i private_key -o StrictHostKeyChecking=no -p ${SSH_PORT:-22} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+          set -e
+          cd "${{ secrets.DEPLOY_PATH }}"
+          # Install PHP dependencies (optimize for prod)
+          composer install --no-interaction --prefer-dist --no-dev --optimize-autoloader
+          # Ensure storage and cache directories exist
+          php artisan storage:link || true
+          php artisan config:cache
+          php artisan route:cache || true
+          php artisan view:cache || true
+          php artisan migrate --force
+          EOF
+        env:
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+
+    # Notes:
+    # - Configure the following repository secrets:
+    #   SSH_HOST: your.server.com
+    #   SSH_USER: deploy
+    #   SSH_KEY: private SSH key (PEM) with access to the server (no passphrase)
+    #   SSH_PORT: optional, default 22
+    #   DEPLOY_PATH: absolute path on server where code should be deployed, e.g. /var/www/html/laravel
+    # - Ensure the server has PHP, Composer, Node (if needed), and correct permissions for the deploy user.
+    # - Ensure .env exists on the server with production config and correct APP_KEY.
+
+
